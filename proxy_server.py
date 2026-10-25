@@ -16,6 +16,9 @@ import argparse
 import re
 import ast
 import atexit
+import copy
+import codecs
+import hashlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 from werkzeug.serving import make_server
@@ -326,6 +329,20 @@ def create_http_session():
 
 # Create global session (reuse across requests)
 _http_session = create_http_session()
+
+
+def create_native_http_session():
+    """Pool connections without replaying native inference requests."""
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=0, pool_connections=50, pool_maxsize=100,
+                          pool_block=False)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+_native_http_session = create_native_http_session()
+_NATIVE_RESPONSES_TIMEOUT = (15, 300)
 
 app = Flask(__name__)
 
@@ -3148,6 +3165,8 @@ def generate_responses_streaming(endpoint_url, headers, chat_payload, model, sub
     input_tokens = 0
     output_tokens = 0
 
+    response = None
+    terminal_seen = False
     try:
         chat_payload["stream"] = True
         # Remove fields not supported by SAP AI Core backend
@@ -3178,6 +3197,7 @@ def generate_responses_streaming(endpoint_url, headers, chat_payload, model, sub
             data_str = line[6:]
             if data_str.strip() == "[DONE]":
                 logging.debug("Responses streaming: received [DONE]")
+                terminal_seen = True
                 break
             try:
                 chunk = json.loads(data_str)
@@ -3193,6 +3213,8 @@ def generate_responses_streaming(endpoint_url, headers, chat_payload, model, sub
                     output_tokens = usage.get("completion_tokens", output_tokens)
                 continue
             delta = choices[0].get("delta", {})
+            if choices[0].get("finish_reason") in {"stop", "tool_calls", "function_call", "length", "content_filter"}:
+                terminal_seen = True
 
             # Handle text content deltas
             content = delta.get("content")
@@ -3269,12 +3291,19 @@ def generate_responses_streaming(endpoint_url, headers, chat_payload, model, sub
                 input_tokens = usage.get("prompt_tokens", input_tokens)
                 output_tokens = usage.get("completion_tokens", output_tokens)
 
-        response.close()
-
     except Exception as e:
         logging.error(f"Error streaming responses API: {e}", exc_info=True)
-        # Don't return - fall through to emit done/completed events
-        # so the client sees a proper stream termination
+        yield emit_event("error", {"type": "error", "code": "upstream_stream_error",
+                                  "message": "Upstream stream failed before completion"})
+        return
+    finally:
+        if response is not None:
+            response.close()
+
+    if not terminal_seen:
+        yield emit_event("error", {"type": "error", "code": "upstream_stream_error",
+                                  "message": "Upstream stream ended before a terminal signal"})
+        return
 
     # Emit done events for text content
     if full_text:
@@ -3358,8 +3387,462 @@ def generate_responses_streaming(endpoint_url, headers, chat_payload, model, sub
 
     # Stage 3+4: Log assembled streaming response
     if _log_requests_enabled and request_id:
-        RequestFileLogger.log(request_id, model, 3, "backend_response", completed_response, agent=_agent)
-        RequestFileLogger.log(request_id, model, 4, "client_response", completed_response, agent=_agent)
+        _responses_log(request_id, model, 3, "backend_response", completed_response, agent)
+        _responses_log(request_id, model, 4, "client_response", completed_response, agent)
+
+
+_NATIVE_RESPONSES_MODELS = {
+    "gpt-6-astra": "2025-03-01-preview",
+    "gpt-6.1-sol": "2025-03-01-preview",
+}
+
+
+class NativeRequestError(ValueError):
+    def __init__(self, param, message):
+        super().__init__(message)
+        self.param = param
+
+
+class _NativeToolAdapter:
+    """Request-owned, deterministic namespace/function identity mapping."""
+    def __init__(self, payload):
+        self.by_identity = {}
+        self.by_alias = {}
+        self.original_tools = copy.deepcopy(payload.get("tools", []))
+        self.original_choice = copy.deepcopy(payload.get("tool_choice"))
+        self.plain_names = set()
+        self.definitions = set()
+        self.namespaces = set()
+        self.flat_tools = []
+        tools = payload.get("tools", [])
+        if not isinstance(tools, list):
+            self.reject("tools", "Expected an array of function tools")
+        for index, tool in enumerate(tools):
+            param = f"tools[{index}]"
+            if not isinstance(tool, dict):
+                self.reject(param + ".type", "Expected a function or namespace definition")
+            if tool.get("type") == "namespace":
+                namespace = self.name(tool.get("name"), param + ".name")
+                if namespace in self.namespaces:
+                    self.reject(param + ".name", "Duplicate namespace definition")
+                self.namespaces.add(namespace)
+                if set(tool) - {"type", "name", "description", "tools"}:
+                    self.reject(param, "Unsupported namespace definition fields")
+                children = tool.get("tools")
+                if not isinstance(children, list) or not children:
+                    self.reject(param + ".type", "Namespace must contain ordinary function tools")
+                for child_index, child in enumerate(children):
+                    self.add_definition(child, namespace, f"{param}.tools[{child_index}]", tool.get("description"))
+            elif tool.get("type") == "function":
+                self.add_definition(tool, None, param)
+            else:
+                self.reject(param + ".type", "Only function tools and function namespaces are supported")
+        items = payload.get("input", [])
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                if isinstance(item, dict) and item.get("type") in ("function_call", "function_call_output"):
+                    namespace = item.get("namespace")
+                    if namespace is not None:
+                        namespace = self.name(namespace, f"input[{index}].namespace")
+                        self.identity(namespace, self.name(item.get("name"), f"input[{index}].name"))
+                    elif item.get("type") == "function_call" or "name" in item:
+                        self.plain_names.add(self.name(item.get("name"), f"input[{index}].name"))
+        if self.plain_names & self.by_alias.keys():
+            self.reject("tools", "Namespace alias collides with an ordinary function name")
+
+    @staticmethod
+    def reject(param, message):
+        raise NativeRequestError(param, message + "; see docs/CodexCompatibility.md")
+
+    def name(self, value, param):
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+            self.reject(param, "Tool identity must contain 1–64 letters, digits, underscores or hyphens")
+        return value
+
+    def identity(self, namespace, name):
+        identity = (namespace, name)
+        if identity not in self.by_identity:
+            alias = "ns_" + hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()[:60]
+            if alias in self.by_alias and self.by_alias[alias] != identity:
+                self.reject("tools", "Namespace function alias collision")
+            self.by_identity[identity] = alias
+            self.by_alias[alias] = identity
+        return self.by_identity[identity]
+
+    def add_definition(self, tool, namespace, param, namespace_description=None):
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            self.reject(param + ".type", "Namespace children must be ordinary function tools")
+        name = self.name(tool.get("name"), param + ".name")
+        identity = (namespace, name)
+        if identity in self.definitions:
+            self.reject(param + ".name", "Duplicate function identity")
+        self.definitions.add(identity)
+        flat = copy.deepcopy(tool)
+        if namespace is not None:
+            flat["name"] = self.identity(namespace, name)
+            context = f"Function {namespace}.{name}."
+            if namespace_description:
+                if not isinstance(namespace_description, str):
+                    self.reject(param, "Namespace description must be text")
+                context += " " + namespace_description
+            description = tool.get("description")
+            if description is not None and not isinstance(description, str):
+                self.reject(param + ".description", "Function description must be text")
+            flat["description"] = context + "\n" + (description or "")
+        else:
+            self.plain_names.add(name)
+        self.flat_tools.append(flat)
+
+    def to_backend(self, payload):
+        if "tools" in payload:
+            payload["tools"] = copy.deepcopy(self.flat_tools)
+        for index, item in enumerate(payload.get("input", []) if isinstance(payload.get("input"), list) else []):
+            if item.get("type") in ("function_call", "function_call_output") and item.get("namespace") is not None:
+                item["name"] = self.by_identity[(item.pop("namespace"), item["name"])]
+        choice = payload.get("tool_choice")
+        if isinstance(choice, dict) and choice.get("type") == "function":
+            self.name(choice.get("name"), "tool_choice.name")
+        if isinstance(choice, dict) and choice.get("namespace") is not None:
+            identity = (self.name(choice["namespace"], "tool_choice.namespace"),
+                        self.name(choice.get("name"), "tool_choice.name"))
+            if identity not in self.definitions:
+                self.reject("tool_choice", "Selected namespace function is not declared")
+            choice.pop("namespace")
+            choice["name"] = self.by_identity[identity]
+        return payload
+
+    def restore(self, value):
+        """Restore only protocol identity locations, never arbitrary nested schemas/data."""
+        changed = False
+        if not isinstance(value, dict):
+            return changed
+        kind = value.get("type")
+        if kind is not None and not isinstance(kind, str):
+            raise ValueError("Invalid native item type")
+        if kind == "function_call" or (isinstance(kind, str) and kind.startswith("response.function_call")):
+            if "name" in value and not isinstance(value["name"], str):
+                raise ValueError("Invalid native function name")
+            identity = self.by_alias.get(value.get("name"))
+            if identity:
+                value["namespace"], value["name"] = identity
+                changed = True
+        if kind in {"response.output_item.added", "response.output_item.done"}:
+            return self.restore(value.get("item")) or changed
+        if kind in {"response.created", "response.in_progress", "response.completed", "response.failed", "response.incomplete"}:
+            return self.restore(value.get("response")) or changed
+        if value.get("object") != "response":
+            return changed
+        if isinstance(value.get("output"), list):
+            for item in value["output"]:
+                changed = self.restore(item) or changed
+        if self.by_alias and isinstance(value.get("tools"), list):
+            value["tools"] = copy.deepcopy(self.original_tools)
+            changed = True
+        if self.by_alias and "tool_choice" in value and self.original_choice is not None:
+            value["tool_choice"] = copy.deepcopy(self.original_choice)
+            changed = True
+        return changed
+
+
+def prepare_native_responses(payload, headers, tool_adapter=None):
+    """Validate the compatibility envelope; retain supported nested data intact."""
+    def reject(param, message):
+        raise NativeRequestError(param, message + "; see the compatible Codex catalog in docs/CodexCompatibility.md")
+
+    if not isinstance(payload, dict):
+        reject(None, "Expected a JSON object")
+    lite_header = headers.get("X-OpenAI-Responses-Lite")
+    if lite_header and lite_header.lower() not in {"false", "0"}:
+        reject("X-OpenAI-Responses-Lite", "Responses Lite is unsupported")
+    if any("responses-lite" in str(value).lower() for key, value in headers.items()
+           if key.lower() in {"openai-beta", "x-openai-responses-lite"}):
+        reject("OpenAI-Beta", "Responses Lite is unsupported")
+    allowed = {"model", "input", "instructions", "tools", "tool_choice", "parallel_tool_calls",
+               "reasoning", "include", "text", "prompt_cache_key", "client_metadata", "stream",
+               "max_output_tokens", "store", "background", "previous_response_id"}
+    for key in payload:
+        if key not in allowed:
+            reject(key, f"Unsupported field '{key}'")
+    for key in ("stream", "store", "background"):
+        if key in payload and not isinstance(payload[key], bool):
+            reject(key, f"'{key}' must be boolean")
+    for key in ("store", "background"):
+        if payload.get(key, False):
+            reject(key, "Use store: false and foreground inference with client-managed history")
+    if payload.get("previous_response_id") is not None:
+        reject("previous_response_id", "Replay client-managed history instead of server-managed continuation")
+    input_data = payload.get("input")
+    if not isinstance(input_data, (str, list)):
+        reject("input", "'input' must be text or an array of standard Responses items")
+    if isinstance(input_data, list):
+        for index, item in enumerate(input_data):
+            param = f"input[{index}]"
+            if not isinstance(item, dict):
+                reject(param, "Expected a standard Responses item object")
+            item_type = item.get("type", "message" if "role" in item else None)
+            if not isinstance(item_type, str) or item_type not in {"message", "function_call", "function_call_output", "reasoning"}:
+                reject(param + ".type", "Unsupported Responses item type")
+    choice = payload.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") != "function":
+        reject("tool_choice", "Only standard function tool selection is supported")
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict):
+        for key in reasoning:
+            if key not in {"effort", "summary"}:
+                reject("reasoning." + key, "Unsupported reasoning setting")
+    prepared = copy.deepcopy(payload)
+    prepared.pop("background", None)
+    prepared.pop("previous_response_id", None)
+    prepared.setdefault("store", False)
+    prepared.setdefault("stream", False)
+    return (tool_adapter or _NativeToolAdapter(payload)).to_backend(prepared)
+
+
+def _native_safe_diagnostic(value, secrets=()):
+    if isinstance(value, dict):
+        return {key: _native_safe_diagnostic(item, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_native_safe_diagnostic(item, secrets) for item in value]
+    if not isinstance(value, str):
+        return value
+    for secret in sorted(secrets, key=len, reverse=True):
+        if secret:
+            value = value.replace(secret, "[redacted]")
+    value = re.sub(r"(?i)https?://[^\s\"<>]+", "[upstream]", value)
+    value = re.sub(r"(?i)(bearer|basic)\s+\S+", r"\1 [redacted]", value)
+    return value
+
+
+def _native_http_error(upstream, secrets):
+    status = upstream.status_code if upstream.status_code >= 400 else 502
+    error = {"type": "server_error", "message": f"Native upstream rejected request (HTTP {upstream.status_code})"}
+    try:
+        source = upstream.json().get("error")
+        if isinstance(source, dict):
+            error.update(_native_safe_diagnostic(source, secrets))
+        elif isinstance(source, str):
+            error["message"] = _native_safe_diagnostic(source, secrets)
+    except (ValueError, AttributeError, requests.exceptions.RequestException):
+        pass
+    result = jsonify({"error": error})
+    result.status_code = status
+    if status in {429, 503} and upstream.headers.get("Retry-After"):
+        result.headers["Retry-After"] = upstream.headers["Retry-After"]
+    return result
+
+
+class _NativeResponseOwner:
+    """Close a request-owned upstream exactly once, including unstarted iterators."""
+    def __init__(self, upstream):
+        self.upstream = upstream
+        self.closed = False
+        self.lock = threading.Lock()
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+        self.upstream.close()
+
+
+def _responses_log(request_id, model, stage, name, body, agent):
+    try:
+        RequestFileLogger.log(request_id, model, stage, name, body, agent=agent)
+    except Exception:
+        logging.warning("Responses lifecycle logging failed")
+
+
+def _native_sanitize_error(payload, secrets):
+    """Sanitize diagnostic subtrees, not response metadata or semantic output."""
+    if not isinstance(payload, dict):
+        return False
+    keys = {"error"}
+    if payload.get("type") == "error":
+        # Standalone errors carry diagnostics directly, including vendor extensions.
+        keys = payload.keys() - {"type", "sequence_number", "id", "response_id", "object",
+                                 "status", "usage", "output", "response", "tools", "tool_choice",
+                                 "encrypted_content"}
+    changed = False
+    for key in keys:
+        if key in payload:
+            safe = _native_safe_diagnostic(payload[key], secrets)
+            if safe != payload[key]:
+                payload[key] = safe
+                changed = True
+    return changed
+
+
+def _native_record_result(request_id, model, account, agent, body, streaming):
+    _responses_log(request_id, model, 3, "backend_response", body, agent)
+    _responses_log(request_id, model, 4, "client_response", body, agent)
+    usage = body.get("usage") or {}
+    try:
+        log_token_usage(model, account, usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                        usage.get("total_tokens", 0), request_id=request_id, is_streaming=streaming,
+                        error=body.get("status") if body.get("status") != "completed" else None)
+        logging.info("[%s] Native Responses outcome: %s", request_id, body.get("status", "failed"))
+    except Exception:
+        logging.warning("Native usage logging failed")
+
+
+def _native_sse_frames(upstream):
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    pending = ""
+    for chunk in upstream.iter_content(chunk_size=8192):
+        if not chunk:
+            continue
+        pending += decoder.decode(chunk)
+        while True:
+            boundary = re.search(r"\r\n\r\n|\n\n|\r\r", pending)
+            if boundary is None:
+                break
+            frame = pending[:boundary.end()]
+            pending = pending[boundary.end():]
+            yield frame
+    pending += decoder.decode(b"", final=True)
+    if pending.strip():
+        raise ValueError("Unterminated native SSE frame")
+
+
+def _native_valid_response(body):
+    """The common terminal envelope contract for JSON and SSE responses."""
+    return (isinstance(body, dict) and body.get("object") == "response"
+            and isinstance(body.get("id"), str) and isinstance(body.get("output"), list)
+            and body.get("status") in ("completed", "incomplete", "failed"))
+
+
+def generate_native_responses_streaming(owner, request_id=None, model=None, account=None, agent=None, secrets=(), tool_adapter=None):
+    sequence_number = 0
+    outcome = {"status": "failed", "error": {"code": "upstream_stream_error"}, "usage": {}}
+    try:
+        for frame in _native_sse_frames(owner.upstream):
+            data_lines = []
+            event_type = None
+            lines = re.split(r"\r\n|\r|\n", frame)
+            for line in lines:
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip(" "))
+                elif line.startswith("event:"):
+                    event_type = line[6:].strip()
+            if not data_lines:
+                yield frame  # SSE comments/keepalives retain their original framing.
+                continue
+            event = json.loads("\n".join(data_lines))
+            if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+                raise ValueError("Invalid native SSE event")
+            if event_type and event_type != event["type"]:
+                raise ValueError("Native SSE event type mismatch")
+            if isinstance(event.get("sequence_number"), int):
+                sequence_number = event["sequence_number"] + 1
+            if isinstance(event.get("response"), dict):
+                observed = event["response"]
+                if isinstance(observed.get("usage"), dict):
+                    outcome["usage"] = observed["usage"]
+                if observed.get("id"):
+                    outcome["id"] = observed["id"]
+            terminal = event["type"] in {"response.completed", "response.incomplete", "response.failed"}
+            if terminal:
+                response = event.get("response")
+                if not _native_valid_response(response) or response["status"] != event["type"].split(".")[1]:
+                    raise ValueError("Invalid native terminal event")
+            # Diagnostics may carry credentials/URLs; semantic output and opaque reasoning stay intact.
+            changed = False
+            if event["type"] == "error":
+                changed = _native_sanitize_error(event, secrets)
+            elif terminal:
+                changed = _native_sanitize_error(response, secrets)
+            if tool_adapter:
+                changed = tool_adapter.restore(event) or changed
+            if changed:
+                preserved = [line for line in lines if line and not line.startswith("data:")]
+                frame = "\n".join(preserved) + f"\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if terminal:
+                outcome = response
+            yield frame
+            if terminal or event["type"] == "error":
+                return
+        raise ValueError("Native stream ended before a terminal event")
+    except (requests.exceptions.RequestException, ValueError, UnicodeError):
+        error = {"type": "error", "code": "upstream_stream_error", "param": None,
+                 "message": "Native upstream stream failed before completion", "sequence_number": sequence_number}
+        yield f"event: error\ndata: {json.dumps(error)}\n\n"
+    finally:
+        try:
+            owner.close()
+        finally:
+            if request_id:
+                _native_record_result(request_id, model, account, agent, outcome, True)
+
+
+def _proxy_native_responses(payload, model, request_id):
+    """Use the exact configured route, without the generic model fallback."""
+    agent = _detect_agent(request)
+    _responses_log(request_id, model, 1, "client_request", payload, agent)
+    try:
+        tool_adapter = _NativeToolAdapter(payload)
+        payload = prepare_native_responses(payload, request.headers, tool_adapter)
+    except NativeRequestError as error:
+        return jsonify({"error": {"type": "invalid_request_error", "param": error.param,
+                                  "message": str(error)}}), 400
+    _responses_log(request_id, model, 2, "transformed_request", payload, agent)
+    if model not in proxy_config.model_to_subaccounts:
+        return jsonify({"error": {"type": "invalid_request_error", "param": "model",
+                                  "message": f"Model '{model}' not available"}}), 404
+    try:
+        deployment, subaccount_name, _, _ = load_balance_url(model)
+        subaccount = proxy_config.subaccounts[subaccount_name]
+        token = fetch_token(subaccount_name)
+        secrets = (token, subaccount.service_key.clientsecret, *proxy_config.secret_authentication_tokens)
+        headers = {
+            "AI-Resource-Group": subaccount.resource_group,
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "AI-Tenant-Id": subaccount.service_key.identityzoneid,
+        }
+        url = f"{deployment.rstrip('/')}/responses?api-version={_NATIVE_RESPONSES_MODELS[model]}"
+        upstream = _native_http_session.post(
+            url, headers=headers, json=payload, timeout=_NATIVE_RESPONSES_TIMEOUT,
+            allow_redirects=False, stream=True)
+        owner = _NativeResponseOwner(upstream)
+        streaming_owned = False
+        try:
+            if upstream.status_code != 200:
+                error_response = _native_http_error(upstream, secrets)
+                _native_record_result(request_id, model, subaccount_name, agent,
+                                      {"status": "failed", **error_response.get_json()}, payload["stream"])
+                return error_response
+            if payload["stream"]:
+                downstream = Response(stream_with_context(generate_native_responses_streaming(
+                    owner, request_id, model, subaccount_name, agent, secrets, tool_adapter)),
+                                      content_type="text/event-stream",
+                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                downstream.call_on_close(owner.close)
+                streaming_owned = True
+                return downstream
+            try:
+                body = upstream.json()
+            except ValueError:
+                return jsonify({"error": {"type": "server_error", "message": "Invalid native upstream JSON"}}), 502
+            if not _native_valid_response(body):
+                return jsonify({"error": {"type": "server_error", "message": "Invalid native upstream response"}}), 502
+            _native_sanitize_error(body, secrets)
+            try:
+                tool_adapter.restore(body)
+            except ValueError:
+                return jsonify({"error": {"type": "server_error", "message": "Invalid native upstream response"}}), 502
+            _native_record_result(request_id, model, subaccount_name, agent, body, False)
+            return jsonify(body), upstream.status_code
+        finally:
+            if not streaming_owned:
+                owner.close()
+    except (requests.exceptions.Timeout, TimeoutError):
+        return jsonify({"error": {"type": "server_error", "message": "Native upstream timed out"}}), 504
+    except (requests.exceptions.RequestException, ConnectionError):
+        return jsonify({"error": {"type": "server_error", "message": "Native upstream transport failure"}}), 502
+    except Exception:
+        return jsonify({"error": {"type": "server_error",
+                                  "message": "Native Responses configuration or upstream failure"}}), 500
 
 
 @app.route('/v1/responses', methods=['POST'])
@@ -3372,14 +3855,19 @@ def proxy_responses_request():
     logging.info("Received request to /v1/responses (payload size: %s / %s bytes, ~%s tokens)",
                  _format_bytes(_size), _size, request_token_estimate(request))
     logging.debug("Request headers: %s", _redact_headers(request.headers))
-    logging.debug("Request body:\n%s", _LazyJSON(request.get_json(), indent=4))
+    logging.debug("Request body:\n%s", _LazyJSON(request.get_json(silent=True), indent=4))
 
     if not verify_request_token(request):
         logging.info("Unauthorized request received. Token verification failed.")
         return jsonify({"error": "Unauthorized"}), 401
 
-    payload = request.json
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": {"type": "invalid_request_error", "param": None,
+                                  "message": "Expected a JSON object"}}), 400
     model = payload.get("model")
+    if model in _NATIVE_RESPONSES_MODELS:
+        return _proxy_native_responses(payload, model, request_id)
     if not model:
         logging.warning("No model specified in /v1/responses request, using default")
         model = "gpt-5.4"
@@ -4708,6 +5196,7 @@ def cleanup_on_exit():
     """Cleanup resources on server shutdown"""
     logging.info("Cleaning up HTTP session...")
     _http_session.close()
+    _native_http_session.close()
     logging.info("Server shutdown complete")
 
 atexit.register(cleanup_on_exit)

@@ -240,3 +240,9 @@ config.json.bak2
 
 # Request/response log files
 logs/requests/
+
+# AI coding tools
+.claude/
+.agents/
+.opencode/
+openspec/

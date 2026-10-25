@@ -387,6 +387,52 @@ class TestGenerateResponsesStreaming(unittest.TestCase):
         return events
 
     @patch('proxy_server._http_session')
+    def test_partial_tool_eof_or_exception_cannot_report_completion(self, session):
+        from proxy_server import generate_responses_streaming
+        first = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_partial","function":{"name":"run","arguments":"{"}}]}}]}'
+        for failure in (False, True):
+            response = MagicMock(status_code=200)
+            def lines(**kwargs):
+                yield first
+                if failure:
+                    raise RuntimeError("transport failure")
+            response.iter_lines.side_effect = lines
+            session.post.return_value = response
+            events = self._collect_events(generate_responses_streaming("http://synthetic", {}, {}, "gpt-5.4", "S"))
+            types = [kind for kind, _ in events]
+            self.assertIn("error", types)
+            self.assertNotIn("response.completed", types)
+            self.assertNotIn("response.output_item.done", types)
+            response.close.assert_called_once()
+
+    @patch('proxy_server._http_session')
+    def test_finish_reason_without_done_allows_usage_then_success(self, session):
+        from proxy_server import generate_responses_streaming
+        response = MagicMock(status_code=200)
+        response.iter_lines.return_value = iter([
+            'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+            'data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1}}',
+        ])
+        session.post.return_value = response
+        events = self._collect_events(generate_responses_streaming("http://synthetic", {}, {}, "gpt-5.4", "S"))
+        terminal = events[-1][1]["response"]
+        self.assertEqual(terminal["status"], "completed")
+        self.assertEqual(terminal["usage"]["input_tokens"], 2)
+
+    @patch('proxy_server._http_session')
+    def test_translated_logging_uses_agent_parameter_without_breaking_stream(self, session):
+        import proxy_server
+        response = MagicMock(status_code=200)
+        response.iter_lines.return_value = iter(['data: [DONE]'])
+        session.post.return_value = response
+        with patch.object(proxy_server, '_log_requests_enabled', True), \
+                patch.object(proxy_server.RequestFileLogger, 'log') as logger:
+            events = self._collect_events(proxy_server.generate_responses_streaming(
+                "http://synthetic", {}, {}, "gpt-5.4", "S", request_id="synthetic", agent="Codex"))
+        self.assertEqual(events[-1][0], "response.completed")
+        self.assertEqual(logger.call_args.kwargs["agent"], "Codex")
+
+    @patch('proxy_server._http_session')
     @patch('proxy_server.fetch_token', return_value='test-token')
     def test_text_streaming_event_format(self, mock_token, mock_session):
         """Verify SSE events match the OpenAI Responses API spec."""

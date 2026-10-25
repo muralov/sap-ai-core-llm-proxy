@@ -334,37 +334,35 @@ You:
 
 You can use the SAP AI Core with the OpenAI Codex CLI via the Proxy Server
 
-Install codex
+See the [Codex CLI setup and troubleshooting guideline](./docs/CodexGuideline.md) for
+GPT-6.1 Sol / GPT-6 Astra configuration, credentials from `AICORE_SERVICE_KEY`, and the
+interactive background-server environment issue.
+
+Install the tested Codex version and generate its compatible two-model catalog:
 ```shell
-npm install -g @openai/codex
+npm install -g @openai/codex@0.164.0
+python examples/codex/generate_catalog.py \
+  --astra-context-limit 272000 --astra-max-context-limit 872000 \
+  --sol-context-limit 272000 --sol-max-context-limit 872000 \
+  --output examples/codex/models.json
 ```
 
-Create the codex config.toml
-```shell
-vim  ~/.codex/config.toml
-```
-
-Update the config.toml
-```toml
-model_provider="sapaicore"
-model="gpt-5.4"
-
-[model_providers.sapaicore]
-name="SAP AI Core"
-wire_api="responses"            
-base_url="http://127.0.0.1:3001/v1"  
-env_key="OPENAI_API_KEY"    
-```
+Merge [the Codex configuration example](./examples/codex/config.toml.example) into
+`~/.codex/config.toml`, replacing the catalog placeholder with its absolute path.
+The operator-selected context values are 272k base / 872k extended for both models;
+SAP capacity at those sizes remains unverified. See the
+[compatibility record](./docs/CodexCompatibility.md) for evidence and pending acceptance.
 
 Set your API key (must match one of secret_authentication_tokens in the proxy server config.json):
 
 ```shell
-export OPENAI_API_KEY=your_secret_key
+export SAP_AI_PROXY_API_KEY=your_secret_key
 ```
 
 Then run codex
 ```shell
-codex
+codex --no-daemon --model gpt-6.1-sol
+# Or use gpt-6-astra through the same running proxy.
 ```
 
 For more codex config please check 

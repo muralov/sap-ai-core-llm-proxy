@@ -1,0 +1,39 @@
+# Replace this with the absolute path produced by generate_catalog.py.
+model_catalog_json = "/absolute/path/to/sap-ai-core-llm-proxy/examples/codex/models.json"
+model_provider = "sap_aicore"
+model = "gpt-6.1-sol"
+model_reasoning_effort = "low"
+web_search = "disabled"
+
+[agents]
+enabled = false
+
+[shell_environment_policy]
+inherit = "core"
+include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "LANG", "LC_.*"]
+
+[features]
+image_generation = false
+view_image = false
+apps = false
+plugins = false
+multi_agent = false
+multi_agent_v2 = false
+code_mode = false
+code_mode_only = false
+code_mode_tool_search = false
+enable_request_compression = false
+
+[model_providers.sap_aicore]
+name = "SAP AI Core Proxy"
+base_url = "http://127.0.0.1:3001/v1"
+env_key = "SAP_AI_PROXY_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+
+[model_providers.sap_aicore.capabilities]
+remote_compaction = "unsupported"
+external_web_access = false
